@@ -95,12 +95,12 @@ cc_library(
     hdrs = [
         "Platform.h",
         "RTDevice.h",
-        "TensorRTBindingNames.h",
         "TRTEngine.h",
         "TRTEngineProfiler.h",
+        "TensorRTBindingNames.h",
         "runtime.h",
     ],
-    copts = if_torch_nccl(["-DUSE_C10D_NCCL"]),
+    defines = if_torch_nccl(["USE_C10D_NCCL"]),
     linkopts = [
         "-lstdc++fs",
     ],
@@ -135,9 +135,9 @@ cc_library(
     hdrs = [
         "Platform.h",
         "RTDevice.h",
-        "TensorRTBindingNames.h",
         "TRTEngine.h",
         "TRTEngineProfiler.h",
+        "TensorRTBindingNames.h",
         "runtime.h",
     ],
     deps = [
@@ -151,9 +151,9 @@ filegroup(
     srcs = [
         "Platform.h",
         "RTDevice.h",
-        "TensorRTBindingNames.h",
         "TRTEngine.h",
         "TRTEngineProfiler.h",
+        "TensorRTBindingNames.h",
         "runtime.h",
     ],
     visibility = ["//visibility:public"],
