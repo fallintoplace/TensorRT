@@ -241,6 +241,13 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
 
   auto run_standard_execution = [&]() {
     bool cudagraphs_enabled = (CUDAGRAPHS_MODE == SUBGRAPH_CUDAGRAPHS);
+    // Auto-select the optimization profile from input shapes before validating
+    // shapes, so a profile switch's context_changed flag and shape_key reset are
+    // observed below. Only auto-selection runs per call; manual pins are applied
+    // eagerly via set_active_profile.
+    if (compiled_engine->num_optimization_profiles > 1 && compiled_engine->auto_select_profiles) {
+      compiled_engine->set_active_profile(compiled_engine->auto_select_profile(inputs));
+    }
     bool shape_changed = _validate_shapes(inputs, compiled_engine);
 
     auto current_device_id = inputs.size() > 0 ? inputs[0].device().index() : at::cuda::current_device();
@@ -401,6 +408,11 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
   };
 
   auto run_output_allocator = [&]() {
+    // Auto-select the optimization profile from input shapes before binding
+    // them. Only auto-selection runs per call; manual pins are applied eagerly.
+    if (compiled_engine->num_optimization_profiles > 1 && compiled_engine->auto_select_profiles) {
+      compiled_engine->set_active_profile(compiled_engine->auto_select_profile(inputs));
+    }
     { // Input Setup
       std::unique_ptr<torch::autograd::profiler::RecordProfile> input_profiler_guard;
       if (compiled_engine->profile_execution) {

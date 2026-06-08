@@ -251,6 +251,10 @@ TRTEngine::TRTEngine(
     num_io = std::make_pair(inputs_size, outputs);
   }
 
+  // Reconstruct optimization-profile info (count + per-profile ranges) from the
+  // TRT API so multi-profile selection works for any loaded engine.
+  this->setup_optimization_profiles();
+
 #ifndef NDEBUG
   this->enable_profiling();
 #endif
@@ -510,6 +514,97 @@ std::vector<std::string> TRTEngine::serialize() {
 
 void TRTEngine::reset_captured_graph() {
   cudagraph.reset();
+}
+
+void TRTEngine::setup_optimization_profiles() {
+  num_optimization_profiles = cuda_engine->getNbOptimizationProfiles();
+  profile_dim_ranges.clear();
+  is_shape_inference_io.clear();
+  for (const auto& name : in_binding_names) {
+    is_shape_inference_io[name] = cuda_engine->isShapeInferenceIO(name.c_str());
+  }
+  if (num_optimization_profiles <= 1) {
+    return;
+  }
+  // name -> [dim] -> [(min, max), ...] (one entry per optimization-profile index).
+  for (int64_t p = 0; p < num_optimization_profiles; ++p) {
+    for (const auto& name : in_binding_names) {
+      if (is_shape_inference_io[name]) {
+        continue;
+      }
+      auto dmin =
+          cuda_engine->getProfileShape(name.c_str(), static_cast<int32_t>(p), nvinfer1::OptProfileSelector::kMIN);
+      auto dmax =
+          cuda_engine->getProfileShape(name.c_str(), static_cast<int32_t>(p), nvinfer1::OptProfileSelector::kMAX);
+      auto& dims = profile_dim_ranges[name];
+      if (dims.empty()) {
+        dims.resize(dmin.nbDims);
+      }
+      for (int d = 0; d < dmin.nbDims; ++d) {
+        dims[d].push_back(std::make_pair(dmin.d[d], dmax.d[d]));
+      }
+    }
+  }
+}
+
+void TRTEngine::set_active_profile(int64_t profile_index) {
+  if (num_optimization_profiles <= 1) {
+    return;
+  }
+  if (profile_index == active_profile_index) {
+    return;
+  }
+  auto stream = c10::cuda::getCurrentCUDAStream(device_info.id);
+  // setOptimizationProfileAsync returns false for an out-of-range index; the
+  // index is validated upstream in TorchTensorRTModule.resolve_profile_index.
+  TORCHTRT_CHECK(
+      exec_ctx->setOptimizationProfileAsync(static_cast<int32_t>(profile_index), stream.stream()),
+      "Failed to switch to optimization profile index " << profile_index);
+  stream.synchronize();
+  active_profile_index = profile_index;
+  // A profile switch invalidates any captured CUDA graph and changes the
+  // context state, so force re-record / shape re-inference on the next call.
+  runtime_states.context_changed = true;
+  reset_captured_graph();
+  shape_key = "None";
+  LOG_DEBUG("Switched to optimization profile index " << profile_index);
+}
+
+int64_t TRTEngine::auto_select_profile(const std::vector<at::Tensor>& inputs) {
+  // Lazy selection: scan profiles in index order and return the first one whose
+  // [min, max] ranges contain every input shape.
+  for (int64_t p = 0; p < num_optimization_profiles; ++p) {
+    bool fits = true;
+    for (size_t i = 0; i < in_binding_names.size() && fits; ++i) {
+      const auto& name = in_binding_names[i];
+      if (i >= inputs.size() || is_shape_inference_io[name]) {
+        continue;
+      }
+      auto ranges_it = profile_dim_ranges.find(name);
+      if (ranges_it == profile_dim_ranges.end()) {
+        continue;
+      }
+      const auto& dims = ranges_it->second;
+      auto sizes = inputs[i].sizes();
+      for (size_t d = 0; d < sizes.size(); ++d) {
+        if (d < dims.size()) {
+          int64_t lo = dims[d][p].first;
+          int64_t hi = dims[d][p].second;
+          if (!(lo <= sizes[d] && sizes[d] <= hi)) {
+            fits = false;
+            break;
+          }
+        }
+      }
+    }
+    if (fits) {
+      return p;
+    }
+  }
+  TORCHTRT_THROW_ERROR(
+      "No optimization profile matches the input shapes. Fix the input shapes or pin a profile "
+      "explicitly via optimization_profile(module, index).");
+  return 0; // unreachable
 }
 
 void TRTEngine::set_resource_allocation_strategy(TRTEngine::ResourceAllocationStrategy new_strategy) {

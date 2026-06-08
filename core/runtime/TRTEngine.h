@@ -218,6 +218,33 @@ struct TRTEngine : torch::CustomClassHolder {
   bool use_pre_allocated_outputs = false;
   std::vector<at::Tensor> pre_allocated_outputs;
 
+  // --- Multiple optimization profiles ---
+  // State and helpers mirror the Python runtime (TRTEngine in _TRTEngine.py) so
+  // the C++ and Python runtimes are interchangeable: the same attribute and
+  // method names are exposed via torchbind in register_jit_hooks.cpp
+  // (``num_optimization_profiles``, ``_active_profile_index``,
+  // ``_auto_select_profiles``, ``set_active_profile``). Index validation lives
+  // in the runtime-agnostic TorchTensorRTModule.resolve_profile_index.
+  int64_t num_optimization_profiles = 1; // cuda_engine->getNbOptimizationProfiles()
+  int64_t active_profile_index = 0; // profile currently loaded in exec_ctx
+  bool auto_select_profiles = false; // opt-in shape-based selection (per call)
+  // input name -> [dim index] -> per-profile [min, max]; cached from the TRT
+  // API. The dim axis is a dense vector indexed by dimension.
+  std::unordered_map<std::string, std::vector<std::vector<std::pair<int64_t, int64_t>>>> profile_dim_ranges;
+  std::unordered_map<std::string, bool> is_shape_inference_io;
+
+  // Cache profile count + per-profile dim ranges purely from the TRT API
+  // (getNbOptimizationProfiles / getProfileShape) so selection works for any
+  // loaded engine with no extra serialized metadata.
+  void setup_optimization_profiles();
+  // Switch the active TRT optimization profile (idempotent).
+  void set_active_profile(int64_t profile_index);
+  // Lazy / first-working: first profile whose [min, max] fits all input shapes.
+  // Called internally from the execute_engine run paths (guarded by
+  // num_optimization_profiles > 1 && auto_select_profiles); manual pins are
+  // applied eagerly via set_active_profile.
+  int64_t auto_select_profile(const std::vector<at::Tensor>& inputs);
+
   // Single placeholder buffer for empty tensor inputs (allocated once, reused)
   void* empty_tensor_placeholder = nullptr;
 

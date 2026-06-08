@@ -249,6 +249,13 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
         # engines compiled with native multi-device collective layers.
         self._nccl_comm: Optional[Any] = None
 
+        # Multiple optimization profiles. Manual selection by default:
+        # ``_active_profile_index`` is the profile currently loaded in the TRT
+        # context (default 0, reused across calls). ``_auto_select_profiles``
+        # opts into shape-based selection, re-evaluated on every forward.
+        self._active_profile_index = 0
+        self._auto_select_profiles = False
+
         self._load_serialized_info(serialized_info)
         self._setup_engine()
 
@@ -312,6 +319,9 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
         # NCCL communicators cannot be pickled; rebind lazily on the next
         # forward pass via setup_nccl_comm().
         self._nccl_comm = None
+
+        self._active_profile_index = 0
+        self._auto_select_profiles = False
 
         serialized_info = list(state[0])
         engine_field = serialized_info[ENGINE_IDX]
@@ -499,6 +509,7 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
             input_name: self.cuda_engine.is_shape_inference_io(input_name)
             for input_name in self.in_binding_names
         }
+        self._setup_optimization_profiles()
         if self.requires_output_allocator:
             self.create_output_allocator()
 
@@ -613,6 +624,87 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
         self.context = self._create_execution_context()
         self._rtx_native_cudagraphs = True
         logger.info("Switched to TRT-RTX native CUDA graphs")
+
+    def _setup_optimization_profiles(self) -> None:
+        """Cache per-profile shape ranges from the TRT API.
+
+        Rebuilds the profile bounds via ``get_tensor_profile_shape`` so that
+        runtime profile selection works for engines compiled in-process, loaded
+        from cache, or deserialized from disk — no new serialization fields.
+        Populates:
+
+        - ``_profile_dim_ranges``: ``name -> [dim] -> [(min, max), ...]`` (the dim
+          axis is a dense list indexed by dimension; one ``(min, max)`` tuple per
+          optimization-profile index), used for auto-selection containment.
+        """
+        self.num_optimization_profiles = self.cuda_engine.num_optimization_profiles
+        self._profile_dim_ranges: Dict[str, List[List[Tuple[int, int]]]] = {}
+
+        if self.num_optimization_profiles <= 1:
+            return
+
+        for p in range(self.num_optimization_profiles):
+            for name in self.in_binding_names:
+                if self.is_shape_inference_io.get(name, False):
+                    continue
+                rmin, _, rmax = self.cuda_engine.get_tensor_profile_shape(name, p)
+                dims = self._profile_dim_ranges.setdefault(name, [])
+                if not dims:
+                    dims.extend([] for _ in range(len(rmin)))
+                for d, (lo, hi) in enumerate(zip(rmin, rmax)):
+                    dims[d].append((int(lo), int(hi)))
+
+    # --- optimization profile selection ---
+
+    def set_active_profile(self, profile_index: int) -> None:
+        """Make ``profile_index`` the active TRT optimization profile (idempotent)."""
+        if self.num_optimization_profiles <= 1:
+            return
+        if profile_index == self._active_profile_index:
+            return
+        stream = self._engine_stream or torch.cuda.current_stream(self._target_device)
+        self.context.set_optimization_profile_async(profile_index, stream.cuda_stream)
+        stream.synchronize()
+        self._active_profile_index = profile_index
+        # A profile switch invalidates any captured CUDA graph and changes the
+        # context state, so force re-record / shape re-inference next run.
+        self.runtime_states.context_changed = True
+        self.reset_captured_graph()
+        self.shape_key = None
+        logger.debug(f"Switched to optimization profile index {profile_index}")
+
+    def _auto_select_profile(self, inputs: Sequence[torch.Tensor]) -> int:
+        """Select an optimization profile from input shapes.
+
+        Lazy selection: scan profiles in index order and return the **first** one
+        whose ``[min, max]`` ranges contain every input shape. Overlapping
+        profiles therefore resolve to the lowest matching index; pin manually via
+        ``optimization_profile(module, index)`` to force a specific profile.
+        """
+        for p in range(self.num_optimization_profiles):
+            fits = True
+            for i, name in enumerate(self.in_binding_names):
+                if i >= len(inputs) or self.is_shape_inference_io.get(name, False):
+                    continue
+                shape = tuple(int(s) for s in inputs[i].shape)
+                ranges = self._profile_dim_ranges.get(name, [])
+                for d, extent in enumerate(shape):
+                    if d < len(ranges):
+                        lo, hi = ranges[d][p]
+                        if not (lo <= extent <= hi):
+                            fits = False
+                            break
+                if not fits:
+                    break
+            if fits:
+                return p
+
+        raise RuntimeError(
+            "No optimization profile matches the input shapes "
+            f"{[tuple(t.shape) for t in inputs]}. Cached profile ranges: "
+            f"{self._profile_dim_ranges}. Fix the input shapes or pin a profile "
+            "explicitly via optimization_profile(module, index)."
+        )
 
     # --- distributed / NCCL ---
 
@@ -882,7 +974,7 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
         ):
             # Captured CUDA graph was recorded against the old stream.
             self.runtime_states.context_changed = True
-        return caller_on_default
+        return bool(caller_on_default)
 
     def _execute_standard(
         self, contiguous_inputs: List[torch.Tensor]
@@ -913,6 +1005,12 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
         # cudagraph recapture (set_runtime_states consumes and resets the
         # flag).
         caller_on_default = self._prepare_streams(contiguous_inputs)
+        # Auto-select the optimization profile from input shapes before
+        # validating shapes, so set_active_profile's context_changed flag is
+        # consumed by set_runtime_states below. Manual pins are applied eagerly
+        # in set_optimization_profile, so only auto needs per-call selection.
+        if self.num_optimization_profiles > 1 and self._auto_select_profiles:
+            self.set_active_profile(self._auto_select_profile(contiguous_inputs))
         shape_changed = self.validate_input_shapes(contiguous_inputs)
         (
             need_cudagraphs_record,
@@ -970,7 +1068,7 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
 
         with self._profile_section("TRTEngine:TensorRTRuntime"):
             if caller_on_default:
-                self._engine_stream.wait_stream(self._caller_stream)
+                self._engine_stream.wait_stream(self._caller_stream)  # type: ignore[union-attr]
             with torch.cuda.stream(self._engine_stream):
                 if self.resource_allocation_strategy:
                     self._dynamic_workspace = torch.empty(
@@ -989,7 +1087,7 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
                             self.cudagraph, stream=self._engine_stream
                         ):
                             self.context.execute_async_v3(
-                                self._engine_stream.cuda_stream
+                                self._engine_stream.cuda_stream  # type: ignore[union-attr]
                             )
                         if self._profile_execution:
                             self.cudagraph.debug_dump(
@@ -997,10 +1095,10 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
                             )
                     self.cudagraph.replay()  # type: ignore[union-attr]
                 else:
-                    self.context.execute_async_v3(self._engine_stream.cuda_stream)
+                    self.context.execute_async_v3(self._engine_stream.cuda_stream)  # type: ignore[union-attr]
 
             if caller_on_default:
-                self._caller_stream.wait_stream(self._engine_stream)
+                self._caller_stream.wait_stream(self._engine_stream)  # type: ignore[union-attr]
 
         if self.use_pre_allocated_outputs and (
             self.output_tensors_are_unowned
@@ -1026,6 +1124,10 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
                 "incompatible runtime modes. Please disable one of the two."
             )
 
+        # Only auto-selection needs per-call work; manual pins are applied eagerly.
+        if self.num_optimization_profiles > 1 and self._auto_select_profiles:
+            self.set_active_profile(self._auto_select_profile(contiguous_inputs))
+
         with self._profile_section("TRTEngine:ProcessInputs"):
             self.setup_input_tensors(contiguous_inputs, False, False)
 
@@ -1043,11 +1145,11 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
 
         with self._profile_section("TRTEngine:TensorRTRuntime"):
             if caller_on_default:
-                self._engine_stream.wait_stream(self._caller_stream)
+                self._engine_stream.wait_stream(self._caller_stream)  # type: ignore[union-attr]
             with torch.cuda.stream(self._engine_stream):
-                self.context.execute_async_v3(self._engine_stream.cuda_stream)
+                self.context.execute_async_v3(self._engine_stream.cuda_stream)  # type: ignore[union-attr]
             if caller_on_default:
-                self._caller_stream.wait_stream(self._engine_stream)
+                self._caller_stream.wait_stream(self._engine_stream)  # type: ignore[union-attr]
 
         outputs = []
         assert self.output_allocator is not None
