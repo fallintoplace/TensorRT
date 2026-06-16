@@ -9,6 +9,7 @@ from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple, Union
 
 import sympy
 import torch
+import torch.utils._pytree as pytree
 from torch.export import ExportedProgram
 from torch.fx.node import Target
 from torch.utils._sympy.numbers import int_oo
@@ -916,38 +917,53 @@ def _build_user_symbol_bounds(
     """
     placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
 
-    sample_by_name: dict[str, Input] = {}
-    for i, node in enumerate(placeholders):
-        if i < len(sample_arg_inputs):
-            inp = sample_arg_inputs[i]
-            if isinstance(inp, Input) and inp.shape_mode == Input._ShapeMode.DYNAMIC:
-                sample_by_name[node.target] = inp
-    for name, inp in sample_kwarg_inputs.items():
-        if isinstance(inp, Input) and inp.shape_mode == Input._ShapeMode.DYNAMIC:
-            sample_by_name[name] = inp
+    # Flatten args+kwargs in pytree order — guaranteed to match placeholder
+    # order by torch.export, so we can zip directly without name matching.
+    flat_inputs, _ = pytree.tree_flatten((list(sample_arg_inputs), sample_kwarg_inputs))
 
     user_symbol_bounds: Dict[sympy.Symbol, Tuple[int, int]] = {}
-    if not sample_by_name:
-        return user_symbol_bounds
 
-    for node in placeholders:
-        if node.target not in sample_by_name:
+    for node, inp in zip(placeholders, flat_inputs):
+        if not (isinstance(inp, Input) and inp.shape_mode == Input._ShapeMode.DYNAMIC):
             continue
-        sample_input = sample_by_name[node.target]
         fake_val = node.meta.get("val")
         if not isinstance(fake_val, torch.Tensor):
             continue
 
-        min_shape = sample_input.shape["min_shape"]
-        max_shape = sample_input.shape["max_shape"]
+        min_shape = inp.shape["min_shape"]
+        max_shape = inp.shape["max_shape"]
+
+        if len(fake_val.size()) != len(min_shape):
+            raise ValueError(
+                f"Input '{node.target}' has {len(fake_val.size())} dimensions in "
+                f"the exported program, but the provided Input specifies "
+                f"{len(min_shape)} dimensions. Ensure Input.min_shape, "
+                f"Input.opt_shape, and Input.max_shape each have "
+                f"{len(fake_val.size())} entries."
+            )
 
         for d, dim in enumerate(fake_val.size()):
-            if not isinstance(dim, torch.SymInt) or d >= len(min_shape):
+            if not isinstance(dim, torch.SymInt):
+                if min_shape[d] != dim or max_shape[d] != dim:
+                    raise ValueError(
+                        f"Input '{node.target}' dim {d} is static (size={int(dim)}) "
+                        f"in the exported program, but the provided Input has "
+                        f"min_shape[{d}]={min_shape[d]}, max_shape[{d}]={max_shape[d]}. "
+                        f"Static dimensions must be fixed."
+                    )
                 continue
             expr = dim.node.expr
             # Composite exprs (e.g. ``2*s0``) are recomputed by
             # ``ShapeEnv.bound_sympy``; overriding them directly would lie.
             if not isinstance(expr, sympy.Symbol):
+                logger.debug(
+                    "Input '%s' dim %d is a composite symbolic expression (%s) "
+                    "bounded by another dynamic dimension; its range will be "
+                    "derived from constituent symbols via bound_sympy.",
+                    node.target,
+                    d,
+                    expr,
+                )
                 continue
             if expr in user_symbol_bounds:
                 continue
