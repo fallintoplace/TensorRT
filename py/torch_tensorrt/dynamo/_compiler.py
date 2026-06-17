@@ -9,7 +9,6 @@ from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple, Union
 
 import sympy
 import torch
-import torch.utils._pytree as pytree
 from torch.export import ExportedProgram
 from torch.fx.node import Target
 from torch.utils._sympy.numbers import int_oo
@@ -917,9 +916,9 @@ def _build_user_symbol_bounds(
     """
     placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
 
-    # Flatten args+kwargs in pytree order — guaranteed to match placeholder
-    # order by torch.export, so we can zip directly without name matching.
-    flat_inputs, _ = pytree.tree_flatten((list(sample_arg_inputs), sample_kwarg_inputs))
+    in_spec = getattr(gm, "_in_spec", None)
+    assert in_spec is not None, "Exported graph module missing _in_spec"
+    flat_inputs = in_spec.flatten_up_to((list(sample_arg_inputs), sample_kwarg_inputs))
 
     user_symbol_bounds: Dict[sympy.Symbol, Tuple[int, int]] = {}
 
