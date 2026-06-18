@@ -700,10 +700,13 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
     def device_memory_budget(self, budget_bytes: int) -> None:
         if budget_bytes < 0:
             budget_bytes = self.streamable_device_memory_budget
+        # TRT 11+ rejects setWeightStreamingBudgetV2 while an IExecutionContext
+        # is alive (use_count must be 1). Drop the context BEFORE setting the
+        # budget — matches the C++ runtime's TRTEngine::set_device_memory_budget.
+        self.invalidate_context()
         self.cuda_engine.weight_streaming_budget_v2 = budget_bytes
         if self.cuda_engine.weight_streaming_budget_v2 != budget_bytes:
             logger.error(f"Failed to set weight streaming budget to {budget_bytes}")
-        self.invalidate_context()
         self.runtime_states.context_changed = True
 
     def reset_captured_graph(self) -> None:
